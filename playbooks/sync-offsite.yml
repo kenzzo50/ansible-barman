@@ -2,6 +2,9 @@
 - name: Backup 3-2-1 Offsite Cloud Sync — Barman PostgreSQL 17
   hosts: all
   become: true
+  vars_files:
+    - "../group_vars/all/vars.yml"
+    - "../group_vars/all/vault.yml"
   vars:
     server_id: "tm_pg_17_edpostgres17"
     offsite_dir: "/var/backups/barman-offsite"
@@ -64,13 +67,50 @@
           done
       changed_when: false
 
-    - name: Registrar métrica de sucesso da Sincronização Offsite no InfluxDB
+    - name: Registrar métrica de sucesso da Sincronização Offsite Local no InfluxDB
       ansible.builtin.shell:
         cmd: >
           curl -s -i -XPOST 'http://127.0.0.1:8086/write?db=telegraf'
           --data-binary "barman_offsite_sync,server={{ server_id }} status=0i,size_bytes={{ archive_info.stat.size }}i,backup_id=\"{{ target_backup_id }}\""
       changed_when: false
 
-    - name: Exibir resumo da sincronização offsite
+    - name: Sincronizar pacote de backup e checksum para o Cloudflare R2
+      ansible.builtin.shell:
+        cmd: |
+          python3 -c '
+          import os, boto3
+          s3 = boto3.client(
+              "s3",
+              endpoint_url="{{ r2_endpoint }}",
+              aws_access_key_id="{{ r2_access_key }}",
+              aws_secret_access_key="{{ r2_secret_key }}",
+              region_name="auto"
+          )
+          archive = "{{ offsite_dir }}/{{ archive_name }}"
+          checksum = "{{ offsite_dir }}/{{ archive_name }}.sha256"
+          s3.upload_file(archive, "{{ r2_bucket }}", os.path.basename(archive))
+          s3.upload_file(checksum, "{{ r2_bucket }}", os.path.basename(checksum))
+          print("R2 upload completed for " + os.path.basename(archive))
+          # Aplicar política de retenção no R2 (manter últimos {{ r2_offsite_retention | default(3) }})
+          objs = s3.list_objects_v2(Bucket="{{ r2_bucket }}", Prefix="barman_offsite_")
+          if "Contents" in objs:
+              archives = [o["Key"] for o in objs["Contents"] if o["Key"].endswith(".tar.gz")]
+              archives.sort(reverse=True)
+              for old_arch in archives[{{ r2_offsite_retention | default(3) }}:]:
+                  s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch)
+                  s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch + ".sha256")
+                  print("Deleted old R2 backup: " + old_arch)
+          '
+      register: r2_sync_res
+      changed_when: true
+
+    - name: Registrar métrica de sucesso do envio Cloudflare R2 no InfluxDB
+      ansible.builtin.shell:
+        cmd: >
+          curl -s -i -XPOST 'http://127.0.0.1:8086/write?db=telegraf'
+          --data-binary "barman_r2_sync,server={{ server_id }},bucket={{ r2_bucket }} status=0i,size_bytes={{ archive_info.stat.size }}i,backup_id=\"{{ target_backup_id }}\""
+      changed_when: false
+
+    - name: Exibir resumo da sincronização offsite e Cloudflare R2
       ansible.builtin.debug:
-        msg: "Backup {{ target_backup_id }} sincronizado com sucesso em {{ offsite_dir }}/{{ archive_name }} ({{ archive_info.stat.size }} bytes)"
+        msg: "Backup {{ target_backup_id }} sincronizado localmente em {{ offsite_dir }}/{{ archive_name }} e enviado com sucesso ao Cloudflare R2 ({{ r2_bucket }})!"
