@@ -90,7 +90,7 @@
           Host: $(hostname)
           OS: $(uname -srm)
           Containers Ativos no Momento do Snapshot:
-          $(docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}")
+          $(docker ps --format "table {% raw %}{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}{% endraw %}")
           
           Conteúdo do Snapshot:
           - postgresql17_dumpall.sql.gz (Todos os bancos: nexus3, zabbix7, grafana11, migration, keycloak, n8n_db, typebot_db, evolution_db, terraform_security)
