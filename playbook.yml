@@ -1,0 +1,7 @@
+---
+- name: Provisionar e Configurar Barman Backup para PostgreSQL 17
+  hosts: all
+  become: true
+  tasks:
+    - name: Executar tarefas principais de provisionamento do Barman
+      ansible.builtin.import_tasks: tasks/main.yml

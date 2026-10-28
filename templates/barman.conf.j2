@@ -1,0 +1,9 @@
+[barman]
+barman_user = barman
+configuration_files_directory = /etc/barman.d
+barman_home = {{ barman_data_dir }}
+log_file = /var/log/barman/barman.log
+log_level = INFO
+compression = gzip
+retention_policy_mode = auto
+wal_retention_policy = main

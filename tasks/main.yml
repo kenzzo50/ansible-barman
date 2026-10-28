@@ -1,0 +1,190 @@
+---
+# Tarefas de Provisionamento do Barman Backup para PostgreSQL 17
+
+- name: Criar diretórios no Host para o Barman e PostgreSQL WALs
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    - { path: "{{ barman_data_dir }}", mode: "0755" }
+    - { path: "{{ barman_backup_dir }}", mode: "0755" }
+    - { path: "{{ barman_config_dir }}", mode: "0755" }
+    - { path: "{{ barman_log_dir }}", mode: "0755" }
+    - { path: "{{ barman_data_dir }}/{{ pg_server_id }}/incoming", owner: "70", group: "70", mode: "0777" }
+    - { path: "{{ pg_data_path }}/barman_wal", owner: "70", group: "70", mode: "0777" }
+    - { path: "/home/ers/.ssh", owner: "ers", group: "ers", mode: "0700" }
+
+- name: Garantir permissões de barman_wal para o usuário postgres
+  ansible.builtin.command:
+    cmd: docker exec {{ pg_container_name }} chown -R postgres:postgres /var/lib/postgresql/data/barman_wal
+  changed_when: false
+
+- name: Gerar par de chaves SSH para o Barman no Host
+  ansible.builtin.command:
+    cmd: ssh-keygen -t ed25519 -N "" -f "{{ barman_ssh_key }}"
+    creates: "{{ barman_ssh_key }}"
+  become: false
+
+- name: Ler chave pública SSH do Barman
+  ansible.builtin.slurp:
+    src: "{{ barman_ssh_key }}.pub"
+  register: barman_pubkey
+
+- name: Autorizar chave pública do Barman em authorized_keys do host ers
+  ansible.posix.authorized_key:
+    user: ers
+    key: "{{ barman_pubkey.content | b64decode }}"
+    state: present
+
+- name: Criar usuário barman no PostgreSQL 17
+  ansible.builtin.command:
+    cmd: >
+      docker exec {{ pg_container_name }} psql -U {{ pg_admin_user }} -d postgres -c
+      "DO $$ BEGIN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ pg_user }}') THEN
+          CREATE ROLE {{ pg_user }} WITH LOGIN REPLICATION SUPERUSER PASSWORD '{{ pg_pass }}';
+        ELSE
+          ALTER ROLE {{ pg_user }} WITH LOGIN REPLICATION SUPERUSER PASSWORD '{{ pg_pass }}';
+        END IF;
+      END $$;"
+  register: create_pg_user
+  changed_when: "'CREATE ROLE' in create_pg_user.stdout or 'ALTER ROLE' in create_pg_user.stdout"
+
+- name: Configurar parâmetros de replicação e WALs no PostgreSQL 17
+  ansible.builtin.command:
+    cmd: >
+      docker exec {{ pg_container_name }} psql -U {{ pg_admin_user }} -d postgres -c "{{ item }}"
+  loop:
+    - "ALTER SYSTEM SET wal_level = 'replica';"
+    - "ALTER SYSTEM SET archive_mode = 'on';"
+    - "ALTER SYSTEM SET archive_command = 'test ! -f /var/lib/postgresql/data/barman_wal/%f && cp %p /var/lib/postgresql/data/barman_wal/%f';"
+    - "ALTER SYSTEM SET max_wal_senders = 10;"
+    - "ALTER SYSTEM SET max_replication_slots = 10;"
+    - "ALTER SYSTEM SET archive_timeout = 300;"
+  register: alter_system_res
+  changed_when: "'ALTER SYSTEM' in alter_system_res.stdout"
+
+- name: Verificar se archive_mode já está ativo no PostgreSQL
+  ansible.builtin.command:
+    cmd: docker exec {{ pg_container_name }} psql -U {{ pg_admin_user }} -d postgres -tAc "SHOW archive_mode;"
+  register: pg_archive_mode_check
+  changed_when: false
+
+- name: Configurar regras de acesso replication no pg_hba.conf
+  ansible.builtin.blockinfile:
+    path: "{{ pg_data_path }}/pg_hba.conf"
+    marker: "# {mark} ANSIBLE MANAGED BARMAN REPLICATION RULES"
+    insertbefore: "host all all all scram-sha-256"
+    block: |
+      host replication {{ pg_user }} all trust
+      host all {{ pg_user }} all trust
+
+- name: Reiniciar container do PostgreSQL 17 para aplicar archive_mode
+  ansible.builtin.command:
+    cmd: docker restart {{ pg_container_name }}
+  when: pg_archive_mode_check.stdout != 'on'
+
+- name: Aguardar PostgreSQL retornar após reinício
+  ansible.builtin.command:
+    cmd: docker exec {{ pg_container_name }} pg_isready -U {{ pg_admin_user }} -h 127.0.0.1 -p {{ pg_port }}
+  register: pg_ready
+  until: pg_ready.rc == 0
+  retries: 15
+  delay: 2
+  changed_when: false
+
+- name: Criar slot de replicação física barman no PostgreSQL 17
+  ansible.builtin.command:
+    cmd: >
+      docker exec {{ pg_container_name }} psql -U {{ pg_admin_user }} -d postgres -c
+      "SELECT pg_create_physical_replication_slot('barman')
+       WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'barman');"
+  register: create_slot_res
+  changed_when: "'pg_create_physical_replication_slot' in create_slot_res.stdout"
+
+- name: Renderizar arquivos de configuração do Barman (/etc/barman.conf e /etc/barman.d)
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "templates/barman.conf.j2", dest: "/etc/barman.conf" }
+    - { src: "templates/server.conf.j2", dest: "{{ barman_config_dir }}/{{ pg_server_id }}.conf" }
+
+- name: Construir imagem Docker do Barman (tm_pg_barman:latest)
+  ansible.builtin.command:
+    cmd: docker build -t {{ barman_image_name }} /home/ers/workspace/ansible-barman/docker/
+  register: docker_build_res
+  changed_when: "'naming to' in docker_build_res.stdout"
+
+- name: Garantir que container Barman antigo seja removido
+  ansible.builtin.command:
+    cmd: docker rm -f {{ barman_container_name }}
+  failed_when: false
+  changed_when: false
+
+- name: Subir container do Barman (tm_pg_barman)
+  ansible.builtin.command:
+    cmd: >
+      docker run -d
+      --name {{ barman_container_name }}
+      --restart always
+      -v {{ barman_data_dir }}:/var/lib/barman
+      -v {{ barman_backup_dir }}:/var/backups/barman
+      -v /etc/barman.conf:/etc/barman.conf:ro
+      -v {{ barman_config_dir }}:/etc/barman.d:ro
+      -v {{ barman_log_dir }}:/var/log/barman
+      -v {{ pg_data_path }}/barman_wal:{{ barman_data_dir }}/{{ pg_server_id }}/incoming:rw
+      {{ barman_image_name }}
+  register: docker_run_res
+  changed_when: true
+
+- name: Instalar wrapper do comando barman no Host (/usr/local/bin/barman)
+  ansible.builtin.template:
+    src: templates/barman-wrapper.sh.j2
+    dest: /usr/local/bin/barman
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configurar Cron diário às 14:00 e manutenção contínua (/etc/cron.d/barman-backup)
+  ansible.builtin.template:
+    src: templates/barman_cron.j2
+    dest: /etc/cron.d/barman-backup
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Aguardar container do Barman inicializar
+  ansible.builtin.pause:
+    seconds: 3
+
+- name: Inicializar slot de WAL streaming no Barman
+  ansible.builtin.command:
+    cmd: /usr/local/bin/barman receive-wal --create-slot {{ pg_server_id }}
+  failed_when: false
+  changed_when: false
+
+- name: Disparar barman cron para iniciar receive-wal e manutenção
+  ansible.builtin.command:
+    cmd: /usr/local/bin/barman cron
+  changed_when: false
+
+- name: Aguardar 3 segundos para sincronização dos processos
+  ansible.builtin.pause:
+    seconds: 3
+
+- name: Executar barman check para validação do status
+  ansible.builtin.command:
+    cmd: /usr/local/bin/barman check {{ pg_server_id }}
+  register: barman_check_result
+  changed_when: false
+
+- name: Exibir resultado do barman check
+  ansible.builtin.debug:
+    var: barman_check_result.stdout_lines

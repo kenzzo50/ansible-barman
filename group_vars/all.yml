@@ -1,0 +1,30 @@
+---
+# Configurações do Barman (Backup and Recovery Manager para PostgreSQL 17)
+barman_container_name: tm_pg_barman
+barman_image_name: tm_pg_barman:latest
+
+# Diretórios no Host
+barman_data_dir: /var/lib/barman
+barman_backup_dir: /var/backups/barman
+barman_config_dir: /etc/barman.d
+barman_log_dir: /var/log/barman
+
+# Retenção de 3 backups completos e agendamento às 14:00 diárias
+barman_retention: 3
+barman_backup_hour: "14"
+barman_backup_minute: "00"
+
+# Parâmetros de Conexão com o PostgreSQL 17
+pg_container_name: tm_pg_17_edpostgres17
+pg_server_id: tm_pg_17_edpostgres17
+pg_host: "172.17.0.1"
+pg_port: 5432
+pg_user: barman
+pg_pass: barman
+pg_admin_user: postgres
+pg_admin_pass: postgres
+pg_data_path: /var/lib/docker/volumes/tm_pg_17_edpostgres17_data/_data
+
+# Usuário e SSH
+barman_ssh_user: barman
+barman_ssh_key: /home/ers/.ssh/id_ed25519_barman

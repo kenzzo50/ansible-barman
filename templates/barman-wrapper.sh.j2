@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Host wrapper script to execute Barman inside the Docker container
+exec docker exec -i {{ barman_container_name }} barman "$@"

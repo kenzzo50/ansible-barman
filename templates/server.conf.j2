@@ -1,0 +1,12 @@
+[{{ pg_server_id }}]
+description = "PostgreSQL 17 Database Server (TimeMachine)"
+conninfo = host={{ pg_host }} port={{ pg_port }} user={{ pg_user }} dbname=postgres password={{ pg_pass }}
+streaming_conninfo = host={{ pg_host }} port={{ pg_port }} user={{ pg_user }} dbname=postgres password={{ pg_pass }}
+backup_method = postgres
+streaming_archiver = on
+slot_name = barman
+immediate_checkpoint = true
+retention_policy = REDUNDANCY {{ barman_retention }}
+retention_policy_mode = auto
+wal_retention_policy = main
+archiver = on

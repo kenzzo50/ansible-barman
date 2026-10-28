@@ -1,0 +1,4 @@
+# Backup diário agendado para às 14:00 (retenção de {{ barman_retention }} backups)
+{{ barman_backup_minute }} {{ barman_backup_hour }} * * * root /usr/local/bin/barman backup {{ pg_server_id }} >> /var/log/barman/cron_backup.log 2>&1
+# Execução periódica do barman cron para processamento contínuo de WALs e retenção
+*/5 * * * * root /usr/local/bin/barman cron >> /var/log/barman/cron_maintenance.log 2>&1
