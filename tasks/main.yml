@@ -60,7 +60,7 @@
   loop:
     - "ALTER SYSTEM SET wal_level = 'replica';"
     - "ALTER SYSTEM SET archive_mode = 'on';"
-    - "ALTER SYSTEM SET archive_command = 'test ! -f /var/lib/postgresql/data/barman_wal/%f && cp %p /var/lib/postgresql/data/barman_wal/%f';"
+    - "ALTER SYSTEM SET archive_command = 'test ! -f /var/lib/postgresql/data/barman_wal/%f && cp %p /var/lib/postgresql/data/barman_wal/%f && chmod 666 /var/lib/postgresql/data/barman_wal/%f';"
     - "ALTER SYSTEM SET max_wal_senders = 10;"
     - "ALTER SYSTEM SET max_replication_slots = 10;"
     - "ALTER SYSTEM SET archive_timeout = 300;"

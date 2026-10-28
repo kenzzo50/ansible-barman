@@ -1,0 +1,44 @@
+pipeline {
+    agent any
+
+    environment {
+        HOST_WORKSPACE = '/home/ers/workspace/ansible-barman'
+    }
+
+    triggers {
+        // Execução semanal todo domingo às 03:00 da madrugada
+        cron('H 3 * * 0')
+    }
+
+    stages {
+        stage('Sincronizar Repositório') {
+            steps {
+                sshagent(credentials: ['ssh-ubuntu']) {
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "cd ${HOST_WORKSPACE} && git pull origin main"
+                    """
+                }
+            }
+        }
+
+        stage('Executar Disaster Recovery Restore Drill') {
+            steps {
+                sshagent(credentials: ['ssh-ubuntu']) {
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "cd ${HOST_WORKSPACE} && sudo ansible-playbook playbooks/restore-drill.yml"
+                    """
+                }
+            }
+        }
+
+        stage('Verificar Métrica no InfluxDB') {
+            steps {
+                sshagent(credentials: ['ssh-ubuntu']) {
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "curl -sG 'http://127.0.0.1:8086/query?db=telegraf' --data-urlencode 'q=SELECT * FROM barman_dr_restore ORDER BY time DESC LIMIT 1'"
+                    """
+                }
+            }
+        }
+    }
+}

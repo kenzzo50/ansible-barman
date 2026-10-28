@@ -1,0 +1,76 @@
+---
+- name: Backup 3-2-1 Offsite Cloud Sync — Barman PostgreSQL 17
+  hosts: all
+  become: true
+  vars:
+    server_id: "tm_pg_17_edpostgres17"
+    offsite_dir: "/var/backups/barman-offsite"
+    offsite_retention: 3
+  tasks:
+    - name: Garantir diretório de destino Offsite seguro
+      ansible.builtin.file:
+        path: "{{ offsite_dir }}"
+        state: directory
+        owner: "ers"
+        group: "ers"
+        mode: "0750"
+
+    - name: Identificar o último backup válido no Barman
+      ansible.builtin.shell:
+        cmd: /usr/local/bin/barman list-backup {{ server_id }} | grep -v ' - FAILED' | head -n 1 | awk '{print $2}'
+      register: latest_backup_res
+      changed_when: false
+
+    - name: Validar se existe backup disponível para sincronização
+      ansible.builtin.fail:
+        msg: "Nenhum backup disponível para o servidor {{ server_id }}"
+      when: latest_backup_res.stdout | trim == ""
+
+    - name: Definir ID do backup selecionado
+      ansible.builtin.set_fact:
+        target_backup_id: "{{ latest_backup_res.stdout | trim }}"
+        archive_name: "barman_offsite_{{ latest_backup_res.stdout | trim }}.tar.gz"
+
+    - name: Verificar se o arquivo offsite já existe
+      ansible.builtin.stat:
+        path: "{{ offsite_dir }}/{{ archive_name }}"
+      register: offsite_archive_stat
+
+    - name: Criar arquivo compactado offsite do backup selecionado
+      ansible.builtin.shell:
+        cmd: >
+          tar -czf {{ offsite_dir }}/{{ archive_name }}
+          -C /var/lib/barman/{{ server_id }}/base {{ target_backup_id }}
+      when: not offsite_archive_stat.stat.exists
+      register: tar_create_res
+      changed_when: true
+
+    - name: Gerar checksum SHA256 do pacote offsite
+      ansible.builtin.shell:
+        cmd: sha256sum {{ offsite_dir }}/{{ archive_name }} > {{ offsite_dir }}/{{ archive_name }}.sha256
+      changed_when: true
+
+    - name: Obter tamanho do arquivo offsite gerado
+      ansible.builtin.stat:
+        path: "{{ offsite_dir }}/{{ archive_name }}"
+      register: archive_info
+
+    - name: Aplicar política de retenção no diretório offsite (manter os últimos {{ offsite_retention }} pacotes)
+      ansible.builtin.shell:
+        cmd: |
+          cd {{ offsite_dir }}
+          ls -1t barman_offsite_*.tar.gz 2>/dev/null | tail -n +{{ offsite_retention + 1 }} | while read f; do
+            rm -f "$f" "$f.sha256"
+          done
+      changed_when: false
+
+    - name: Registrar métrica de sucesso da Sincronização Offsite no InfluxDB
+      ansible.builtin.shell:
+        cmd: >
+          curl -s -i -XPOST 'http://127.0.0.1:8086/write?db=telegraf'
+          --data-binary "barman_offsite_sync,server={{ server_id }} status=0i,size_bytes={{ archive_info.stat.size }}i,backup_id=\"{{ target_backup_id }}\""
+      changed_when: false
+
+    - name: Exibir resumo da sincronização offsite
+      ansible.builtin.debug:
+        msg: "Backup {{ target_backup_id }} sincronizado com sucesso em {{ offsite_dir }}/{{ archive_name }} ({{ archive_info.stat.size }} bytes)"

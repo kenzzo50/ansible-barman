@@ -20,9 +20,9 @@ pg_server_id: tm_pg_17_edpostgres17
 pg_host: "172.17.0.1"
 pg_port: 5432
 pg_user: barman
-pg_pass: barman
+pg_pass: "{{ vault_pg_pass }}"
 pg_admin_user: postgres
-pg_admin_pass: postgres
+pg_admin_pass: "{{ vault_pg_admin_pass }}"
 pg_data_path: /var/lib/docker/volumes/tm_pg_17_edpostgres17_data/_data
 
 # Usuário e SSH

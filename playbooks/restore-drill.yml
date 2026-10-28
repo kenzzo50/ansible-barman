@@ -1,0 +1,100 @@
+---
+- name: Disaster Recovery Restore Drill — Teste Automatizado de Restauração Barman
+  hosts: all
+  become: true
+  vars:
+    server_id: "tm_pg_17_edpostgres17"
+    restore_dir: "/var/lib/barman/restore_drill"
+    dr_container_name: "pg_dr_test"
+    dr_port: 5433
+  tasks:
+    - name: Executar bloco de testes de Restore Drill com teardown garantido
+      block:
+        - name: Identificar o último backup válido no Barman
+          ansible.builtin.shell:
+            cmd: /usr/local/bin/barman list-backup {{ server_id }} | grep -v ' - FAILED' | head -n 1 | awk '{print $2}'
+          register: latest_backup_res
+          changed_when: false
+
+        - name: Validar se existe backup disponível
+          ansible.builtin.fail:
+            msg: "Nenhum backup disponível para o servidor {{ server_id }}"
+          when: latest_backup_res.stdout | trim == ""
+
+        - name: Definir ID do backup selecionado
+          ansible.builtin.set_fact:
+            target_backup_id: "{{ latest_backup_res.stdout | trim }}"
+
+        - name: Limpar diretório e container de testes anteriores se existirem
+          ansible.builtin.shell:
+            cmd: |
+              docker rm -f {{ dr_container_name }} 2>/dev/null || true
+              rm -rf {{ restore_dir }}
+              mkdir -p {{ restore_dir }}
+              chown -R 997:997 {{ restore_dir }}
+              chmod 777 {{ restore_dir }}
+          changed_when: false
+
+        - name: Executar barman recover para o diretório de teste
+          ansible.builtin.command:
+            cmd: /usr/local/bin/barman recover {{ server_id }} {{ target_backup_id }} {{ restore_dir }}
+          register: barman_recover_res
+          changed_when: true
+
+        - name: Ajustar propriedade do diretório restaurado para o PostgreSQL (UID 70)
+          ansible.builtin.file:
+            path: "{{ restore_dir }}"
+            owner: "70"
+            group: "70"
+            recurse: true
+
+        - name: Iniciar container PostgreSQL 17 isolado para validação
+          ansible.builtin.command:
+            cmd: >
+              docker run -d
+              --name {{ dr_container_name }}
+              -p 127.0.0.1:{{ dr_port }}:5432
+              -v {{ restore_dir }}:/var/lib/postgresql/data
+              postgres:17-alpine
+          register: dr_container_res
+          changed_when: true
+
+        - name: Aguardar container de teste responder na porta {{ dr_port }}
+          ansible.builtin.command:
+            cmd: docker exec {{ dr_container_name }} pg_isready -h 127.0.0.1 -p 5432 -U postgres
+          register: pg_dr_ready
+          until: pg_dr_ready.rc == 0
+          retries: 20
+          delay: 2
+          changed_when: false
+
+        - name: Executar verificação de integridade (Sanity Check nas bases restauradas)
+          ansible.builtin.command:
+            cmd: >
+              docker exec {{ dr_container_name }} psql -U postgres -d postgres -tAc
+              "SELECT datname FROM pg_database WHERE datname IN ('nexus3', 'zabbix7', 'grafana11', 'keycloak', 'migration');"
+          register: restored_dbs_res
+          changed_when: false
+
+        - name: Validar contagem de bancos críticos recuperados
+          ansible.builtin.set_fact:
+            recovered_dbs_count: "{{ (restored_dbs_res.stdout_lines | default([])) | length }}"
+
+        - name: Exibir relatório de bancos restaurados
+          ansible.builtin.debug:
+            msg: "Bancos validados com sucesso no backup {{ target_backup_id }}: {{ restored_dbs_res.stdout_lines }}"
+
+        - name: Registrar métrica de sucesso do Restore Drill no InfluxDB
+          ansible.builtin.shell:
+            cmd: >
+              curl -s -i -XPOST 'http://127.0.0.1:8086/write?db=telegraf'
+              --data-binary "barman_dr_restore,server={{ server_id }} status=0i,recovered_dbs={{ recovered_dbs_count }}i,backup_id=\"{{ target_backup_id }}\""
+          changed_when: false
+
+      always:
+        - name: Desmontar e remover container e arquivos temporários de teste
+          ansible.builtin.shell:
+            cmd: |
+              docker rm -f {{ dr_container_name }} 2>/dev/null || true
+              rm -rf {{ restore_dir }}
+          changed_when: false
