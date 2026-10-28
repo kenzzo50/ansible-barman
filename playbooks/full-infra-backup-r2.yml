@@ -54,21 +54,21 @@
       ansible.builtin.shell:
         cmd: |
           tar -czf {{ temp_work_dir }}/jenkins_essential_data.tar.gz \
-            -C /var/jenkins_home jobs users secrets credentials.xml config.xml 2>/dev/null || true
+            -C /home/ers/workspace/terraform-portal/volumes/jenkins jobs users secrets credentials.xml config.xml 2>/dev/null || true
       changed_when: true
 
     - name: 5. Backup de Repositórios Bare e Configurações do Gerrit
       ansible.builtin.shell:
         cmd: |
           tar -czf {{ temp_work_dir }}/gerrit_etc_and_git.tar.gz \
-            -C /var/gerrit etc git 2>/dev/null || true
+            -C /home/ers/workspace/terraform-portal/volumes gerrit_etc gerrit_git 2>/dev/null || true
       changed_when: true
 
     - name: 6. Backup de Configurações e Repositórios do Gitea
       ansible.builtin.shell:
         cmd: |
           tar -czf {{ temp_work_dir }}/gitea_data.tar.gz \
-            -C /data/gitea conf ssh 2>/dev/null || true
+            -C /home/ers/workspace/terraform-portal/volumes/gitea gitea/conf ssh 2>/dev/null || true
       changed_when: true
 
     - name: 7. Backup Portátil do Banco Telegraf no InfluxDB
