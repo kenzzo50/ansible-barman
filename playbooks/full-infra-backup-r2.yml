@@ -1,0 +1,184 @@
+---
+- name: Disaster Recovery — Backup Completo da Infraestrutura para o Cloudflare R2
+  hosts: all
+  become: true
+  vars_files:
+    - "../group_vars/all/vars.yml"
+    - "../group_vars/all/vault.yml"
+  vars:
+    snapshot_dir: "/var/backups/infra-snapshots"
+    r2_infra_retention: 3
+
+  tasks:
+    - name: Definir timestamp único e caminhos do snapshot
+      ansible.builtin.set_fact:
+        backup_ts: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+      run_once: true
+
+    - name: Definir nomes dos arquivos de snapshot
+      ansible.builtin.set_fact:
+        temp_work_dir: "/tmp/infra_snapshot_{{ backup_ts }}"
+        archive_name: "infra_full_snapshot_{{ backup_ts }}.tar.gz"
+
+    - name: Garantir diretório de armazenamento local e temporário
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "ers"
+        group: "ers"
+        mode: "0750"
+      loop:
+        - "{{ snapshot_dir }}"
+        - "{{ temp_work_dir }}"
+
+    - name: 1. Backup Lógico Completo do PostgreSQL 17 (Todos os Bancos e Roles)
+      ansible.builtin.shell:
+        cmd: >
+          docker exec -i tm_pg_17_edpostgres17 pg_dumpall -U postgres | gzip > {{ temp_work_dir }}/postgresql17_dumpall.sql.gz
+      changed_when: true
+
+    - name: 2. Backup Lógico Completo do MySQL 9.0 (Gitea e Schemas de Apps)
+      ansible.builtin.shell:
+        cmd: >
+          docker exec -i tm_mysql_9_0_edmysql9 mysqldump -uroot -proot --all-databases 2>/dev/null | gzip > {{ temp_work_dir }}/mysql9_dumpall.sql.gz
+      changed_when: true
+
+    - name: 3. Backup de Diretório e Estrutura do OpenLDAP
+      ansible.builtin.shell:
+        cmd: |
+          docker exec -i tf_openldap slapcat -n 1 > {{ temp_work_dir }}/openldap_users.ldif 2>/dev/null || true
+          docker exec -i tf_openldap slapcat -n 0 > {{ temp_work_dir }}/openldap_config.ldif 2>/dev/null || true
+      changed_when: true
+
+    - name: 4. Backup de Configurações, Jobs e Segredos do Jenkins
+      ansible.builtin.shell:
+        cmd: |
+          tar -czf {{ temp_work_dir }}/jenkins_essential_data.tar.gz \
+            -C /var/jenkins_home jobs users secrets credentials.xml config.xml 2>/dev/null || true
+      changed_when: true
+
+    - name: 5. Backup de Repositórios Bare e Configurações do Gerrit
+      ansible.builtin.shell:
+        cmd: |
+          tar -czf {{ temp_work_dir }}/gerrit_etc_and_git.tar.gz \
+            -C /var/gerrit etc git 2>/dev/null || true
+      changed_when: true
+
+    - name: 6. Backup de Configurações e Repositórios do Gitea
+      ansible.builtin.shell:
+        cmd: |
+          tar -czf {{ temp_work_dir }}/gitea_data.tar.gz \
+            -C /data/gitea conf ssh 2>/dev/null || true
+      changed_when: true
+
+    - name: 7. Backup Portátil do Banco Telegraf no InfluxDB
+      ansible.builtin.shell:
+        cmd: |
+          docker exec -i tf_influxdb rm -rf /tmp/influx_dr_tmp 2>/dev/null || true
+          docker exec -i tf_influxdb influxd backup -portable /tmp/influx_dr_tmp >/dev/null 2>&1
+          docker cp tf_influxdb:/tmp/influx_dr_tmp {{ temp_work_dir }}/influxdb_backup
+          docker exec -i tf_influxdb rm -rf /tmp/influx_dr_tmp
+      changed_when: true
+
+    - name: 8. Gerar Manifesto com Lista de Containers e Hash dos Artefatos
+      ansible.builtin.shell:
+        cmd: |
+          cat << 'EOF' > {{ temp_work_dir }}/MANIFEST.txt
+          =======================================================
+          CLOUD OPS LAB — DISASTER RECOVERY INFRASTRUCTURE SNAPSHOT
+          Data do Backup: $(date -Iseconds)
+          Host: $(hostname)
+          OS: $(uname -srm)
+          Containers Ativos no Momento do Snapshot:
+          $(docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}")
+          
+          Conteúdo do Snapshot:
+          - postgresql17_dumpall.sql.gz (Todos os bancos: nexus3, zabbix7, grafana11, migration, keycloak, n8n_db, typebot_db, evolution_db, terraform_security)
+          - mysql9_dumpall.sql.gz (Bancos gitea1_22, mysql_app_db)
+          - openldap_users.ldif / openldap_config.ldif (Base OpenLDAP dc=erscloudops,dc=org)
+          - jenkins_essential_data.tar.gz (Jobs, Pipelines, Users, Secrets, Credentials)
+          - gerrit_etc_and_git.tar.gz (Gerrit Git bare repos, reviews, All-Projects, All-Users)
+          - gitea_data.tar.gz (Gitea conf, ssh, repos)
+          - influxdb_backup/ (Métricas históricas Telegraf)
+          =======================================================
+          EOF
+      changed_when: true
+
+    - name: 9. Compactar Snapshot Completo da Infraestrutura
+      ansible.builtin.shell:
+        cmd: >
+          tar -czf {{ snapshot_dir }}/{{ archive_name }}
+          -C {{ temp_work_dir }} .
+      changed_when: true
+
+    - name: 10. Gerar Checksum SHA256 do Snapshot Consolidado
+      ansible.builtin.shell:
+        cmd: sha256sum {{ snapshot_dir }}/{{ archive_name }} > {{ snapshot_dir }}/{{ archive_name }}.sha256
+      changed_when: true
+
+    - name: 11. Limpar Diretório Temporário de Extração
+      ansible.builtin.file:
+        path: "{{ temp_work_dir }}"
+        state: absent
+
+    - name: 12. Obter Informações do Pacote Consolidado
+      ansible.builtin.stat:
+        path: "{{ snapshot_dir }}/{{ archive_name }}"
+      register: snapshot_stat
+
+    - name: 13. Aplicar Política de Retenção Local (Manter Últimos {{ r2_infra_retention }} Snapshots)
+      ansible.builtin.shell:
+        cmd: |
+          cd {{ snapshot_dir }}
+          ls -1t infra_full_snapshot_*.tar.gz 2>/dev/null | tail -n +{{ r2_infra_retention + 1 }} | while read f; do
+            rm -f "$f" "$f.sha256"
+          done
+      changed_when: false
+
+    - name: 14. Enviar Pacote de Snapshot e Checksum para o Cloudflare R2
+      ansible.builtin.shell:
+        cmd: |
+          python3 -c '
+          import os, boto3
+          s3 = boto3.client(
+              "s3",
+              endpoint_url="{{ r2_endpoint }}",
+              aws_access_key_id="{{ r2_access_key }}",
+              aws_secret_access_key="{{ r2_secret_key }}",
+              region_name="auto"
+          )
+          archive = "{{ snapshot_dir }}/{{ archive_name }}"
+          checksum = "{{ snapshot_dir }}/{{ archive_name }}.sha256"
+          key_archive = "infra-snapshots/" + os.path.basename(archive)
+          key_checksum = "infra-snapshots/" + os.path.basename(checksum)
+          
+          print("Iniciando upload de " + os.path.basename(archive) + " para Cloudflare R2...")
+          s3.upload_file(archive, "{{ r2_bucket }}", key_archive)
+          s3.upload_file(checksum, "{{ r2_bucket }}", key_checksum)
+          print("Upload concluído com sucesso!")
+          
+          # Política de retenção no Cloudflare R2
+          objs = s3.list_objects_v2(Bucket="{{ r2_bucket }}", Prefix="infra-snapshots/infra_full_snapshot_")
+          if "Contents" in objs:
+              archives = [o["Key"] for o in objs["Contents"] if o["Key"].endswith(".tar.gz")]
+              archives.sort(reverse=True)
+              for old_arch in archives[{{ r2_infra_retention }}:]:
+                  s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch)
+                  s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch + ".sha256")
+                  print("Removido snapshot antigo no R2: " + old_arch)
+          '
+      register: r2_upload_res
+      changed_when: true
+
+    - name: 15. Registrar Métrica do Snapshot de Infraestrutura no InfluxDB
+      ansible.builtin.shell:
+        cmd: >
+          curl -s -i -XPOST 'http://127.0.0.1:8086/write?db=telegraf'
+          --data-binary "infra_r2_snapshot,server=full_infra,bucket={{ r2_bucket }} status=0i,size_bytes={{ snapshot_stat.stat.size }}i,snapshot_name=\"{{ archive_name }}\""
+      changed_when: false
+
+    - name: 16. Exibir Resumo Executivo da Operação de Disaster Recovery
+      ansible.builtin.debug:
+        msg: >
+          Snapshot {{ archive_name }} criado e armazenado no Cloudflare R2 ({{ r2_bucket }}/infra-snapshots/)!
+          Tamanho: {{ (snapshot_stat.stat.size / (1024*1024)) | round(2) }} MB.

@@ -1,0 +1,106 @@
+pipeline {
+    agent any
+
+    environment {
+        HOST_WORKSPACE = '/home/ers/workspace/ansible-barman'
+        MAIL_TO = 'kenzzo50@gmail.com'
+    }
+
+    triggers {
+        // Agendamento diário às 03:00 da madrugada
+        cron('0 3 * * *')
+    }
+
+    stages {
+        stage('Sincronizar Repositório') {
+            steps {
+                sshagent(credentials: ['ssh-ubuntu']) {
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "cd ${HOST_WORKSPACE} && git pull origin main"
+                    """
+                }
+            }
+        }
+
+        stage('Executar Snapshot Completo da Infraestrutura') {
+            steps {
+                sshagent(credentials: ['ssh-ubuntu']) {
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "cd ${HOST_WORKSPACE} && ansible-playbook playbooks/full-infra-backup-r2.yml"
+                    """
+                }
+            }
+        }
+
+        stage('Obter Detalhes do Snapshot Gerado') {
+            steps {
+                sshagent(credentials: ['ssh-ubuntu']) {
+                    script {
+                        def snapshotInfo = sh(
+                            script: """ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "ls -lh /var/backups/infra-snapshots/infra_full_snapshot_*.tar.gz | tail -n 1 | awk '{print \\\$9, \\\$5}'" """,
+                            returnStdout: true
+                        ).trim()
+                        env.SNAPSHOT_DETAILS = snapshotInfo
+                        echo "Último snapshot gerado: ${env.SNAPSHOT_DETAILS}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                mail to: env.MAIL_TO,
+                     subject: "🛡️ [Disaster Recovery] Snapshot Completo da Infraestrutura Salvo no Cloudflare R2!",
+                     body: """Prezado Administrador,
+
+O Backup Consolidado de Disaster Recovery de toda a sua infraestrutura foi concluído e transmitido com sucesso para o Cloudflare R2!
+
+=======================================================
+RESUMO DO DISASTER RECOVERY SNAPSHOT
+=======================================================
+• Arquivo Gerado: ${env.SNAPSHOT_DETAILS}
+• Destino na Nuvem: Cloudflare R2 (Bucket 'ers-barman-backups' / prefixo 'infra-snapshots/')
+• Formato: Pacote compactado tar.gz + Checksum SHA256
+• Retenção Automática: Últimos 3 snapshots na nuvem e no host local
+• Jenkins Build: ${env.BUILD_URL}
+
+COMPACTAÇÃO E SERVIÇOS SALVOS NO SNAPSHOT:
+1. PostgreSQL 17 (pg_dumpall de todos os 9 bancos: nexus3, zabbix7, grafana11, migration, keycloak, n8n_db, typebot_db, evolution_db, terraform_security)
+2. MySQL 9.0 (mysqldump completo: gitea1_22 e mysql_app_db)
+3. OpenLDAP (slapcat completo: schema config e diretório ou=users,dc=erscloudops,dc=org)
+4. Jenkins CI/CD (Jobs, Pipelines, Users, Secrets e Credentials)
+5. Gerrit Code Review (Repositórios Bare, Reviews, Históricos e Configurações)
+6. Gitea (Configurações, Chaves SSH e Repositórios)
+7. InfluxDB (Backup portátil da base de métricas 'telegraf')
+8. Manifesto de integridade com lista de contêineres e hashes SHA256
+
+COMO RESTAURAR EM UM NOVO SERVIDOR DO ZERO:
+Caso precise subir um servidor novo na nuvem (Hetzner/Contabo/AWS):
+1. Baixe o snapshot do R2: aws s3 cp s3://ers-barman-backups/infra-snapshots/... . --endpoint-url https://02443c6c16ae75bbc8898743e6e5513c.r2.cloudflarestorage.com
+2. Descompacte o pacote: tar -xzf infra_full_snapshot_*.tar.gz
+3. Suba os containers com docker compose e restaure os dumps com psql / mysql / slapadd. Todos os seus portais voltam exatamente no mesmo estado!
+
+Atenciosamente,
+Jenkins CI/CD — CloudOps Lab
+"""
+            }
+        }
+        failure {
+            script {
+                mail to: env.MAIL_TO,
+                     subject: "🚨 [Disaster Recovery] FALHA no Snapshot de Infraestrutura",
+                     body: """Prezado Administrador,
+
+A execução do snapshot completo da infraestrutura para o Cloudflare R2 FALHOU.
+Por favor, verifique os logs do build no Jenkins:
+${env.BUILD_URL}
+
+Atenciosamente,
+Jenkins CI/CD — CloudOps Lab
+"""
+            }
+        }
+    }
+}

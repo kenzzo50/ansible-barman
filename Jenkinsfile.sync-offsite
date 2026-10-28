@@ -3,6 +3,7 @@ pipeline {
 
     environment {
         HOST_WORKSPACE = '/home/ers/workspace/ansible-barman'
+        MAIL_TO = 'kenzzo50@gmail.com'
     }
 
     triggers {
@@ -25,7 +26,7 @@ pipeline {
             steps {
                 sshagent(credentials: ['ssh-ubuntu']) {
                     sh """
-                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "cd ${HOST_WORKSPACE} && sudo ansible-playbook playbooks/sync-offsite.yml"
+                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "cd ${HOST_WORKSPACE} && ansible-playbook playbooks/sync-offsite.yml"
                     """
                 }
             }
@@ -35,9 +36,46 @@ pipeline {
             steps {
                 sshagent(credentials: ['ssh-ubuntu']) {
                     sh """
-                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "curl -sG 'http://127.0.0.1:8086/query?db=telegraf' --data-urlencode 'q=SELECT * FROM barman_offsite_sync ORDER BY time DESC LIMIT 1'"
+                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "curl -sG 'http://127.0.0.1:8086/query?db=telegraf' --data-urlencode 'q=SELECT * FROM barman_r2_sync ORDER BY time DESC LIMIT 1'"
                     """
                 }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                mail to: env.MAIL_TO,
+                     subject: "✅ [Barman Backup] Sincronização Offsite Concluída com Sucesso (PostgreSQL 17 -> Cloudflare R2)",
+                     body: """Prezado Administrador,
+
+A sincronização de backup 3-2-1 para a nuvem Cloudflare R2 foi concluída com sucesso!
+
+• Servidor: tm_pg_17_edpostgres17 (PostgreSQL 17)
+• Destino: Bucket Cloudflare R2 (ers-barman-backups)
+• Tipo de Arquivo: Pacote compactado tar.gz + Checksum SHA256
+• Status: 100% íntegro e sincronizado
+• Jenkins Build: ${env.BUILD_URL}
+
+Atenciosamente,
+Jenkins CI/CD — CloudOps Lab
+"""
+            }
+        }
+        failure {
+            script {
+                mail to: env.MAIL_TO,
+                     subject: "🚨 [Barman Backup] FALHA na Sincronização Offsite (PostgreSQL 17 -> Cloudflare R2)",
+                     body: """Prezado Administrador,
+
+A execução da sincronização offsite para o Cloudflare R2 FALHOU.
+Por favor, verifique os logs do build no Jenkins:
+${env.BUILD_URL}
+
+Atenciosamente,
+Jenkins CI/CD — CloudOps Lab
+"""
             }
         }
     }
