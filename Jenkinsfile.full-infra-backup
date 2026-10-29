@@ -16,7 +16,7 @@ pipeline {
             steps {
                 sshagent(credentials: ['ssh-ubuntu']) {
                     sh """
-                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "cd ${HOST_WORKSPACE} && git pull origin main"
+                    ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "cd ${HOST_WORKSPACE} && git fetch origin && git reset --hard origin/main"
                     """
                 }
             }
@@ -40,8 +40,14 @@ pipeline {
                             script: """ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "ls -lh /var/backups/infra-snapshots/infra_full_snapshot_*.tar.gz | tail -n 1 | awk '{print \\\$9, \\\$5}'" """,
                             returnStdout: true
                         ).trim()
+                        def dotfilesInfo = sh(
+                            script: """ssh -o StrictHostKeyChecking=no ers@172.17.0.1 "ls -lh /var/backups/infra-snapshots/home_dotfiles_*.tar.gz.enc | tail -n 1 | awk '{print \\\$9, \\\$5}'" """,
+                            returnStdout: true
+                        ).trim()
                         env.SNAPSHOT_DETAILS = snapshotInfo
+                        env.DOTFILES_DETAILS = dotfilesInfo
                         echo "Último snapshot gerado: ${env.SNAPSHOT_DETAILS}"
+                        echo "Último dotfiles cifrado gerado: ${env.DOTFILES_DETAILS}"
                     }
                 }
             }
@@ -52,17 +58,20 @@ pipeline {
         success {
             script {
                 mail to: env.MAIL_TO,
-                     subject: "🛡️ [Disaster Recovery] Snapshot Completo da Infraestrutura Salvo no Cloudflare R2!",
+                     subject: "🛡️ [Disaster Recovery] Snapshot Completo e Dotfiles Cifrados Salvos na Nuvem!",
                      body: """Prezado Administrador,
 
-O Backup Consolidado de Disaster Recovery de toda a sua infraestrutura foi concluído e transmitido com sucesso para o Cloudflare R2!
+O Backup Consolidado de Disaster Recovery de toda a sua infraestrutura e dotfiles pessoais foi concluído e transmitido com sucesso para o Cloudflare R2 e processado para o Google Drive!
 
 =======================================================
-RESUMO DO DISASTER RECOVERY SNAPSHOT
+RESUMO DO DISASTER RECOVERY MULTI-NUVEM
 =======================================================
-• Arquivo Gerado: ${env.SNAPSHOT_DETAILS}
-• Destino na Nuvem: Cloudflare R2 (Bucket 'ers-barman-backups' / prefixo 'infra-snapshots/')
-• Formato: Pacote compactado tar.gz + Checksum SHA256
+• Snapshot de Infraestrutura: ${env.SNAPSHOT_DETAILS}
+• Pacote Dotfiles & Chaves: ${env.DOTFILES_DETAILS} (Criptografado AES-256 com Vault Pass)
+• Destinos na Nuvem:
+  - Primário: Cloudflare R2 (Bucket 'ers-barman-backups' / prefixo 'infra-snapshots/')
+  - Redundância Secundária: Google Drive ('ers-infra-backups/' via rclone)
+• Formato: Pacotes compactados tar.gz / tar.gz.enc + Checksums SHA256
 • Retenção Automática: Últimos 3 snapshots na nuvem e no host local
 • Jenkins Build: ${env.BUILD_URL}
 
@@ -74,13 +83,12 @@ COMPACTAÇÃO E SERVIÇOS SALVOS NO SNAPSHOT:
 5. Gerrit Code Review (Repositórios Bare, Reviews, Históricos e Configurações)
 6. Gitea (Configurações, Chaves SSH e Repositórios)
 7. InfluxDB (Backup portátil da base de métricas 'telegraf')
-8. Manifesto de integridade com lista de contêineres e hashes SHA256
+8. Dotfiles & Chaves (/home/ers: .ssh, .gnupg, .docker, .ansible_vault_pass, .cntb.yaml, .jira_config, .gitconfig, etc. cifrados)
+9. Manifesto de integridade com lista de contêineres e hashes SHA256
 
-COMO RESTAURAR EM UM NOVO SERVIDOR DO ZERO:
-Caso precise subir um servidor novo na nuvem (Hetzner/Contabo/AWS):
-1. Baixe o snapshot do R2: aws s3 cp s3://ers-barman-backups/infra-snapshots/... . --endpoint-url https://02443c6c16ae75bbc8898743e6e5513c.r2.cloudflarestorage.com
-2. Descompacte o pacote: tar -xzf infra_full_snapshot_*.tar.gz
-3. Suba os containers com docker compose e restaure os dumps com psql / mysql / slapadd. Todos os seus portais voltam exatamente no mesmo estado!
+COMO RESTAURAR OS DOTFILES E CHAVES:
+openssl enc -d -aes-256-cbc -pbkdf2 -in home_dotfiles_*.tar.gz.enc -out home_dotfiles.tar.gz -pass file:~/.ansible_vault_pass
+tar -xzf home_dotfiles.tar.gz -C /home/ers/
 
 Atenciosamente,
 Jenkins CI/CD — CloudOps Lab

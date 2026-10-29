@@ -19,6 +19,7 @@
       ansible.builtin.set_fact:
         temp_work_dir: "/tmp/infra_snapshot_{{ backup_ts }}"
         archive_name: "infra_full_snapshot_{{ backup_ts }}.tar.gz"
+        dotfiles_archive_name: "home_dotfiles_{{ backup_ts }}.tar.gz.enc"
 
     - name: Garantir diretório de armazenamento local e temporário
       ansible.builtin.file:
@@ -116,15 +117,43 @@
         cmd: sha256sum {{ snapshot_dir }}/{{ archive_name }} > {{ snapshot_dir }}/{{ archive_name }}.sha256
       changed_when: true
 
+    - name: 10b. Compactar e Criptografar Dotfiles e Chaves de /home/ers (Arquivo Separado)
+      ansible.builtin.shell:
+        cmd: |
+          tar --exclude='*Cache*' \
+              --exclude='*cache*' \
+              --exclude='*.log' \
+              --exclude='Trash' \
+              -czf {{ snapshot_dir }}/home_dotfiles_{{ backup_ts }}.tar.gz \
+              -C /home/ers \
+              .ansible_vault_pass .bash_aliases .bashrc .cntb.yaml .copilot .docker .git-templates .gitconfig .gnupg .jira_config .pgpass .profile .ssh .terraform.d .vscode .vscode-shared .cloud-locale-test.skip .wget-hsts 2>/dev/null || true
+
+          # Criptografia forte AES-256-CBC com chave mestra ~/.ansible_vault_pass
+          openssl enc -aes-256-cbc -salt -pbkdf2 -in {{ snapshot_dir }}/home_dotfiles_{{ backup_ts }}.tar.gz \
+            -out {{ snapshot_dir }}/{{ dotfiles_archive_name }} \
+            -pass file:/home/ers/.ansible_vault_pass
+
+          # Remover pacote temporário em texto claro
+          rm -f {{ snapshot_dir }}/home_dotfiles_{{ backup_ts }}.tar.gz
+
+          # Checksum SHA256 do pacote cifrado
+          sha256sum {{ snapshot_dir }}/{{ dotfiles_archive_name }} > {{ snapshot_dir }}/{{ dotfiles_archive_name }}.sha256
+      changed_when: true
+
     - name: 11. Limpar Diretório Temporário de Extração
       ansible.builtin.file:
         path: "{{ temp_work_dir }}"
         state: absent
 
-    - name: 12. Obter Informações do Pacote Consolidado
+    - name: 12. Obter Informações dos Pacotes Consolidados
       ansible.builtin.stat:
         path: "{{ snapshot_dir }}/{{ archive_name }}"
       register: snapshot_stat
+
+    - name: 12b. Obter Informações do Pacote Dotfiles Cifrado
+      ansible.builtin.stat:
+        path: "{{ snapshot_dir }}/{{ dotfiles_archive_name }}"
+      register: dotfiles_stat
 
     - name: 13. Aplicar Política de Retenção Local (Manter Últimos {{ r2_infra_retention }} Snapshots)
       ansible.builtin.shell:
@@ -133,9 +162,12 @@
           ls -1t infra_full_snapshot_*.tar.gz 2>/dev/null | tail -n +{{ r2_infra_retention + 1 }} | while read f; do
             rm -f "$f" "$f.sha256"
           done
+          ls -1t home_dotfiles_*.tar.gz.enc 2>/dev/null | tail -n +{{ r2_infra_retention + 1 }} | while read f; do
+            rm -f "$f" "$f.sha256"
+          done
       changed_when: false
 
-    - name: 14. Enviar Pacote de Snapshot e Checksum para o Cloudflare R2
+    - name: 14. Enviar Pacotes de Snapshot e Dotfiles Cifrados para o Cloudflare R2
       ansible.builtin.shell:
         cmd: |
           python3 -c '
@@ -149,26 +181,60 @@
           )
           archive = "{{ snapshot_dir }}/{{ archive_name }}"
           checksum = "{{ snapshot_dir }}/{{ archive_name }}.sha256"
+          dotfiles = "{{ snapshot_dir }}/{{ dotfiles_archive_name }}"
+          dotfiles_checksum = "{{ snapshot_dir }}/{{ dotfiles_archive_name }}.sha256"
+          
           key_archive = "infra-snapshots/" + os.path.basename(archive)
           key_checksum = "infra-snapshots/" + os.path.basename(checksum)
+          key_dotfiles = "infra-snapshots/" + os.path.basename(dotfiles)
+          key_dotfiles_checksum = "infra-snapshots/" + os.path.basename(dotfiles_checksum)
           
-          print("Iniciando upload de " + os.path.basename(archive) + " para Cloudflare R2...")
+          print("Iniciando upload para Cloudflare R2...")
           s3.upload_file(archive, "{{ r2_bucket }}", key_archive)
           s3.upload_file(checksum, "{{ r2_bucket }}", key_checksum)
-          print("Upload concluído com sucesso!")
+          if os.path.exists(dotfiles):
+              s3.upload_file(dotfiles, "{{ r2_bucket }}", key_dotfiles)
+              s3.upload_file(dotfiles_checksum, "{{ r2_bucket }}", key_dotfiles_checksum)
+              print("Upload do pacote cifrado de dotfiles concluído!")
+          print("Upload no Cloudflare R2 concluído com sucesso!")
           
           # Política de retenção no Cloudflare R2
-          objs = s3.list_objects_v2(Bucket="{{ r2_bucket }}", Prefix="infra-snapshots/infra_full_snapshot_")
+          objs = s3.list_objects_v2(Bucket="{{ r2_bucket }}", Prefix="infra-snapshots/")
           if "Contents" in objs:
-              archives = [o["Key"] for o in objs["Contents"] if o["Key"].endswith(".tar.gz")]
-              archives.sort(reverse=True)
-              for old_arch in archives[{{ r2_infra_retention }}:]:
+              infra_archs = [o["Key"] for o in objs["Contents"] if "infra_full_snapshot_" in o["Key"] and o["Key"].endswith(".tar.gz")]
+              infra_archs.sort(reverse=True)
+              for old_arch in infra_archs[{{ r2_infra_retention }}:]:
                   s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch)
                   s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch + ".sha256")
                   print("Removido snapshot antigo no R2: " + old_arch)
+
+              dot_archs = [o["Key"] for o in objs["Contents"] if "home_dotfiles_" in o["Key"] and o["Key"].endswith(".tar.gz.enc")]
+              dot_archs.sort(reverse=True)
+              for old_arch in dot_archs[{{ r2_infra_retention }}:]:
+                  s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch)
+                  s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch + ".sha256")
+                  print("Removido dotfiles antigo no R2: " + old_arch)
           '
       register: r2_upload_res
       changed_when: true
+
+    - name: 14b. Redundância Multi-Nuvem — Sincronizar com o Google Drive via rclone
+      ansible.builtin.shell:
+        cmd: |
+          if rclone listremotes 2>/dev/null | grep -q "^gdrive:"; then
+            echo "Destino 'gdrive:' detectado no rclone. Iniciando upload para o Google Drive..."
+            rclone copy {{ snapshot_dir }}/{{ archive_name }} gdrive:ers-infra-backups/ --progress
+            rclone copy {{ snapshot_dir }}/{{ archive_name }}.sha256 gdrive:ers-infra-backups/
+            if [ -f "{{ snapshot_dir }}/{{ dotfiles_archive_name }}" ]; then
+              rclone copy {{ snapshot_dir }}/{{ dotfiles_archive_name }} gdrive:ers-infra-backups/
+              rclone copy {{ snapshot_dir }}/{{ dotfiles_archive_name }}.sha256 gdrive:ers-infra-backups/
+            fi
+            echo "Sincronização com Google Drive concluída com sucesso!"
+          else
+            echo "[INFO] Remote 'gdrive:' não configurado no rclone. (Execute 'rclone config' no terminal para ativar sincronização automática com o Google Drive)."
+          fi
+      register: gdrive_sync_res
+      changed_when: "'Iniciando upload' in gdrive_sync_res.stdout"
 
     - name: 15. Registrar Métrica do Snapshot de Infraestrutura no InfluxDB
       ansible.builtin.shell:
@@ -180,5 +246,6 @@
     - name: 16. Exibir Resumo Executivo da Operação de Disaster Recovery
       ansible.builtin.debug:
         msg: >
-          Snapshot {{ archive_name }} criado e armazenado no Cloudflare R2 ({{ r2_bucket }}/infra-snapshots/)!
-          Tamanho: {{ (snapshot_stat.stat.size / (1024*1024)) | round(2) }} MB.
+          Snapshot {{ archive_name }} ({{ (snapshot_stat.stat.size / (1024*1024)) | round(2) }} MB)
+          e Dotfiles Cifrados {{ dotfiles_archive_name }} ({{ (dotfiles_stat.stat.size / 1024) | round(2) }} KB)
+          armazenados no Cloudflare R2 e processados para redundância Multi-Nuvem!
