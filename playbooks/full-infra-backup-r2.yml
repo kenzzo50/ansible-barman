@@ -231,20 +231,7 @@
               rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ dotfiles_archive_name }}.sha256 gdrive:ers-infra-backups/
             fi
             # Aplicar retenção na raiz de gdrive:ers-infra-backups/ (sem tocar subpastas contabo/, contabo-volumes/, runbooks/)
-            python3 - << 'PYGDRIVE'
-            import subprocess
-            cfg = "/home/ers/.config/rclone/rclone.conf"
-            keep = int("{{ r2_infra_retention }}")
-            res = subprocess.run(["rclone", "--config", cfg, "lsf", "--files-only", "gdrive:ers-infra-backups/"], capture_output=True, text=True, timeout=45)
-            if res.returncode == 0:
-                files = [l.strip() for l in res.stdout.splitlines() if l.strip()]
-                infra = sorted([f for f in files if f.startswith("infra_full_snapshot_") and f.endswith(".tar.gz")], reverse=True)
-                dots = sorted([f for f in files if f.startswith("home_dotfiles_") and f.endswith(".tar.gz.enc")], reverse=True)
-                for old in infra[keep:] + dots[keep:]:
-                    subprocess.run(["rclone", "--config", cfg, "deletefile", f"gdrive:ers-infra-backups/{old}"], timeout=60)
-                    subprocess.run(["rclone", "--config", cfg, "deletefile", f"gdrive:ers-infra-backups/{old}.sha256"], timeout=60)
-                    print("Removido antigo GDrive raiz:", old)
-            PYGDRIVE
+            python3 -c 'import subprocess; cfg="/home/ers/.config/rclone/rclone.conf"; keep=int("{{ r2_infra_retention }}"); r=subprocess.run(["rclone","--config",cfg,"lsf","--files-only","gdrive:ers-infra-backups/"],capture_output=True,text=True,timeout=45); files=[l.strip() for l in r.stdout.splitlines() if l.strip()] if r.returncode==0 else []; infra=sorted([f for f in files if f.startswith("infra_full_snapshot_") and f.endswith(".tar.gz")],reverse=True); dots=sorted([f for f in files if f.startswith("home_dotfiles_") and f.endswith(".tar.gz.enc")],reverse=True); [print("Removido antigo GDrive raiz:", old, subprocess.run(["rclone","--config",cfg,"deletefile",f"gdrive:ers-infra-backups/{old}"],timeout=60).returncode, subprocess.run(["rclone","--config",cfg,"deletefile",f"gdrive:ers-infra-backups/{old}.sha256"],timeout=60).returncode) for old in infra[keep:]+dots[keep:]]'
             echo "Sincronização com Google Drive concluída com sucesso!"
           else
             echo "[INFO] Remote 'gdrive:' não configurado no rclone. (Execute 'rclone config' no terminal para ativar sincronização automática com o Google Drive)."
