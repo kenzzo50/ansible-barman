@@ -222,17 +222,21 @@
       ansible.builtin.shell:
         cmd: |
           RCLONE_CFG="/home/ers/.config/rclone/rclone.conf"
+          GDRIVE_SNAP_DIR="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Snapshots_Infra_e_Bancos"
+          GDRIVE_DOT_DIR="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Credenciais_e_Dotfiles_AES256"
           if rclone --config "$RCLONE_CFG" listremotes 2>/dev/null | grep -q "^gdrive:"; then
-            echo "Destino 'gdrive:' detectado no rclone. Iniciando upload para o Google Drive..."
-            rclone --config "$RCLONE_CFG" copy --drive-chunk-size 64M --tpslimit 2 {{ snapshot_dir }}/{{ archive_name }} gdrive:ers-infra-backups/ --progress
-            rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ archive_name }}.sha256 gdrive:ers-infra-backups/
+            echo "Destino 'gdrive:' detectado no rclone. Iniciando upload organizado para ERS-CloudOps..."
+            rclone --config "$RCLONE_CFG" mkdir "$GDRIVE_SNAP_DIR" || true
+            rclone --config "$RCLONE_CFG" mkdir "$GDRIVE_DOT_DIR" || true
+            rclone --config "$RCLONE_CFG" copy --drive-chunk-size 64M --tpslimit 2 --timeout 15m {{ snapshot_dir }}/{{ archive_name }} "$GDRIVE_SNAP_DIR/" --progress
+            rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ archive_name }}.sha256 "$GDRIVE_SNAP_DIR/"
             if [ -f "{{ snapshot_dir }}/{{ dotfiles_archive_name }}" ]; then
-              rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ dotfiles_archive_name }} gdrive:ers-infra-backups/
-              rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ dotfiles_archive_name }}.sha256 gdrive:ers-infra-backups/
+              rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ dotfiles_archive_name }} "$GDRIVE_DOT_DIR/"
+              rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ dotfiles_archive_name }}.sha256 "$GDRIVE_DOT_DIR/"
             fi
-            # Aplicar retenção na raiz de gdrive:ers-infra-backups/ (sem tocar subpastas contabo/, contabo-volumes/, runbooks/)
-            python3 -c 'import subprocess; cfg="/home/ers/.config/rclone/rclone.conf"; keep=int("{{ r2_infra_retention }}"); r=subprocess.run(["rclone","--config",cfg,"lsf","--files-only","gdrive:ers-infra-backups/"],capture_output=True,text=True,timeout=45); files=[l.strip() for l in r.stdout.splitlines() if l.strip()] if r.returncode==0 else []; infra=sorted([f for f in files if f.startswith("infra_full_snapshot_") and f.endswith(".tar.gz")],reverse=True); dots=sorted([f for f in files if f.startswith("home_dotfiles_") and f.endswith(".tar.gz.enc")],reverse=True); [print("Removido antigo GDrive raiz:", old, subprocess.run(["rclone","--config",cfg,"deletefile",f"gdrive:ers-infra-backups/{old}"],timeout=60).returncode, subprocess.run(["rclone","--config",cfg,"deletefile",f"gdrive:ers-infra-backups/{old}.sha256"],timeout=60).returncode) for old in infra[keep:]+dots[keep:]]'
-            echo "Sincronização com Google Drive concluída com sucesso!"
+            # Aplicar retenção de 3 cópias em ambas as subpastas organizadas do Ubuntu Local
+            python3 -c 'import subprocess; cfg="/home/ers/.config/rclone/rclone.conf"; keep=int("{{ r2_infra_retention }}"); sn="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Snapshots_Infra_e_Bancos"; dt="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Credenciais_e_Dotfiles_AES256"; rs=subprocess.run(["rclone","--config",cfg,"lsf","--files-only",f"{sn}/"],capture_output=True,text=True,timeout=45); rd=subprocess.run(["rclone","--config",cfg,"lsf","--files-only",f"{dt}/"],capture_output=True,text=True,timeout=45); infra=sorted([f.strip() for f in rs.stdout.splitlines() if f.strip().startswith("infra_full_snapshot_") and f.strip().endswith(".tar.gz")],reverse=True) if rs.returncode==0 else []; dots=sorted([f.strip() for f in rd.stdout.splitlines() if f.strip().startswith("home_dotfiles_") and f.strip().endswith(".tar.gz.enc")],reverse=True) if rd.returncode==0 else []; [subprocess.run(["rclone","--config",cfg,"deletefile",f"{sn}/{old}"],timeout=60) or subprocess.run(["rclone","--config",cfg,"deletefile",f"{sn}/{old}.sha256"],timeout=60) for old in infra[keep:]]; [subprocess.run(["rclone","--config",cfg,"deletefile",f"{dt}/{old}"],timeout=60) or subprocess.run(["rclone","--config",cfg,"deletefile",f"{dt}/{old}.sha256"],timeout=60) for old in dots[keep:]]'
+            echo "Sincronização com Google Drive (ERS-CloudOps/) concluída com sucesso!"
           else
             echo "[INFO] Remote 'gdrive:' não configurado no rclone. (Execute 'rclone config' no terminal para ativar sincronização automática com o Google Drive)."
           fi
