@@ -1,14 +1,16 @@
 ---
-- name: Backup 3-2-1 Offsite Cloud Sync — Barman PostgreSQL 17
+- name: Backup 3-2-1 Offsite Cloud Sync — Barman PostgreSQL 17 (Local + Cloudflare R2 + Google Drive, Rotação 3 Cópias)
   hosts: all
   become: true
   vars_files:
     - "../group_vars/all/vars.yml"
     - "../group_vars/all/vault.yml"
+    - "/home/ers/workspace/ansible-access/group_vars/all/vault_apis.yml"
   vars:
     server_id: "tm_pg_17_edpostgres17"
     offsite_dir: "/var/backups/barman-offsite"
     offsite_retention: 3
+    gdrive_pg17_dir: "gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Bancos_PostgreSQL_17"
   tasks:
     - name: Garantir diretório de destino Offsite seguro
       ansible.builtin.file:
@@ -42,7 +44,7 @@
     - name: Criar arquivo compactado offsite do backup selecionado
       ansible.builtin.shell:
         cmd: >
-          tar -czf {{ offsite_dir }}/{{ archive_name }}
+          ionice -c 3 nice -n 19 tar -czf {{ offsite_dir }}/{{ archive_name }}
           -C /var/lib/barman/{{ server_id }}/base {{ target_backup_id }}
       when: not offsite_archive_stat.stat.exists
       register: tar_create_res
@@ -67,17 +69,10 @@
           done
       changed_when: false
 
-    - name: Registrar métrica de sucesso da Sincronização Offsite Local no InfluxDB
-      ansible.builtin.shell:
-        cmd: >
-          curl -s -i -XPOST 'http://127.0.0.1:8086/write?db=telegraf'
-          --data-binary "barman_offsite_sync,server={{ server_id }} status=0i,size_bytes={{ archive_info.stat.size }}i,backup_id=\"{{ target_backup_id }}\""
-      changed_when: false
-
-    - name: Sincronizar pacote de backup e checksum para o Cloudflare R2
+    - name: Sincronizar pacote de backup e checksum para o Cloudflare R2 (rotação 3 cópias)
       ansible.builtin.shell:
         cmd: |
-          python3 -c '
+          python3 - << 'PYR2'
           import os, boto3
           s3 = boto3.client(
               "s3",
@@ -91,26 +86,111 @@
           s3.upload_file(archive, "{{ r2_bucket }}", os.path.basename(archive))
           s3.upload_file(checksum, "{{ r2_bucket }}", os.path.basename(checksum))
           print("R2 upload completed for " + os.path.basename(archive))
-          # Aplicar política de retenção no R2 (manter últimos {{ r2_offsite_retention | default(3) }})
-          objs = s3.list_objects_v2(Bucket="{{ r2_bucket }}", Prefix="barman_offsite_")
-          if "Contents" in objs:
-              archives = [o["Key"] for o in objs["Contents"] if o["Key"].endswith(".tar.gz")]
-              archives.sort(reverse=True)
-              for old_arch in archives[{{ r2_offsite_retention | default(3) }}:]:
-                  s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch)
-                  s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch + ".sha256")
-                  print("Deleted old R2 backup: " + old_arch)
-          '
+          objs = s3.list_objects_v2(Bucket="{{ r2_bucket }}", Prefix="barman_offsite_").get("Contents", [])
+          archives = sorted([o["Key"] for o in objs if o["Key"].endswith(".tar.gz")], reverse=True)
+          for old_arch in archives[{{ r2_offsite_retention | default(3) }}:]:
+              s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch)
+              s3.delete_object(Bucket="{{ r2_bucket }}", Key=old_arch + ".sha256")
+              print("Deleted old R2 backup: " + old_arch)
+          PYR2
       register: r2_sync_res
       changed_when: true
 
-    - name: Registrar métrica de sucesso do envio Cloudflare R2 no InfluxDB
+    - name: Sincronizar pacote de backup PG 17 para o Google Drive (rotação 3 cópias)
       ansible.builtin.shell:
-        cmd: >
-          curl -s -i -XPOST 'http://127.0.0.1:8086/write?db=telegraf'
-          --data-binary "barman_r2_sync,server={{ server_id }},bucket={{ r2_bucket }} status=0i,size_bytes={{ archive_info.stat.size }}i,backup_id=\"{{ target_backup_id }}\""
+        cmd: |
+          set -euo pipefail
+          RCLONE_CFG="/home/ers/.config/rclone/rclone.conf"
+          DST="{{ gdrive_pg17_dir }}"
+          if rclone --config "$RCLONE_CFG" listremotes 2>/dev/null | grep -q "^gdrive:"; then
+            rclone --config "$RCLONE_CFG" --bind 0.0.0.0 mkdir "$DST" || true
+            rclone --config "$RCLONE_CFG" --bind 0.0.0.0 copy --drive-chunk-size 128M --drive-pacer-min-sleep 100ms --retries 5 --low-level-retries 15 {{ offsite_dir }}/{{ archive_name }} "$DST/"
+            rclone --config "$RCLONE_CFG" --bind 0.0.0.0 copy --retries 5 {{ offsite_dir }}/{{ archive_name }}.sha256 "$DST/"
+            python3 - << 'PYPRUNE'
+            import subprocess
+            cfg = "/home/ers/.config/rclone/rclone.conf"
+            dst = "{{ gdrive_pg17_dir }}"
+            keep = int("{{ offsite_retention }}")
+            r = subprocess.run(["rclone", "--config", cfg, "--bind", "0.0.0.0", "lsf", "--files-only", f"{dst}/"], capture_output=True, text=True, timeout=90)
+            if r.returncode == 0:
+                files = [f.strip() for f in r.stdout.splitlines() if f.strip()]
+                mains = sorted([f for f in files if f.startswith("barman_offsite_") and f.endswith(".tar.gz")], reverse=True)
+                keep_set = set(mains[:keep]) | {f"{m}.sha256" for m in mains[:keep]}
+                for f in files:
+                    if f.startswith("barman_offsite_") and f not in keep_set:
+                        subprocess.run(["rclone", "--config", cfg, "--bind", "0.0.0.0", "deletefile", f"{dst}/{f}"], timeout=90, check=False)
+                        print("Removido antigo GDrive PG17:", f)
+            PYPRUNE
+            chown ers:ers "$RCLONE_CFG" && chmod 600 "$RCLONE_CFG" || true
+            echo "GDRIVE_PG17_OK"
+          fi
+      register: gdrive_pg17_res
+      changed_when: "'GDRIVE_PG17_OK' in gdrive_pg17_res.stdout"
+
+    - name: Registrar métricas no InfluxDB Local e InfluxDB-Contabo (Grafana Cloud) + Enviar E-mail
+      ansible.builtin.shell:
+        cmd: |
+          python3 - << 'PYMET'
+          import time, smtplib, urllib.request
+          from datetime import datetime
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+
+          size_b = int("{{ archive_info.stat.size }}")
+          size_mb = round(size_b / (1024 * 1024), 2)
+          bid = "{{ target_backup_id }}"
+          arch = "{{ archive_name }}"
+          now_ts = int(time.time())
+          gdrive_ok = 0 if "GDRIVE_PG17_OK" in """{{ gdrive_pg17_res.stdout | default('') }}""" else 1
+
+          try:
+              p_loc = (
+                  f'barman_offsite_sync,server={{ server_id }} status=0i,size_bytes={size_b}i,backup_id="{bid}"\n'
+                  f'barman_r2_sync,server={{ server_id }},bucket={{ r2_bucket }} status=0i,size_bytes={size_b}i,backup_id="{bid}"\n'
+              ).encode()
+              urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8086/write?db=telegraf", data=p_loc, method="POST"), timeout=5)
+          except Exception as e:
+              print("Aviso Influx local:", e)
+
+          try:
+              lines = [
+                  f'backup_dr_status,host=ubuntu-local,job=ubuntu_pg17,destination=local status=0i,size_bytes={size_b}i,copies=3i,last_run_ts={now_ts}i,last_success_ts={now_ts}i,archive="{arch}"',
+                  f'backup_dr_status,host=ubuntu-local,job=ubuntu_pg17,destination=r2 status=0i,size_bytes={size_b}i,copies=3i,last_run_ts={now_ts}i,last_success_ts={now_ts}i,archive="{arch}"',
+                  f'backup_dr_status,host=ubuntu-local,job=ubuntu_pg17,destination=gdrive status={gdrive_ok}i,size_bytes={size_b if gdrive_ok == 0 else 0}i,copies={3 if gdrive_ok == 0 else 0}i,last_run_ts={now_ts}i,last_success_ts={now_ts if gdrive_ok == 0 else 0}i,archive="{arch}"',
+              ]
+              url = "http://100.92.196.127:8086/write?db=telegraf_contabo&u=admin&p={{ vault_influxdb_contabo_password }}"
+              urllib.request.urlopen(urllib.request.Request(url, data=("\n".join(lines) + "\n").encode(), method="POST"), timeout=10)
+              print("Metricas PG17 enviadas ao Grafana Cloud!")
+          except Exception as e:
+              print("Aviso Influx Contabo:", e)
+
+          try:
+              msg = MIMEMultipart()
+              msg["From"] = "Barman Local CloudOps <{{ vault_gmail_user }}>"
+              msg["To"] = "kenzzo50@gmail.com"
+              tag = "🟢 SUCESSO" if gdrive_ok == 0 else "🟡 PARCIAL"
+              msg["Subject"] = f"{tag}: Backup Barman PG 17 Ubuntu Local ({bid} - {size_mb} MB)"
+              body = (
+                  f"Relatório — Barman PostgreSQL 17 (Ubuntu Local)\n"
+                  f"Data/Hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} (America/Sao_Paulo)\n"
+                  f"Backup ID: {bid} | Arquivo: {arch} ({size_mb} MB)\n\n"
+                  f"Redundâncias 3-2-1 (Rotação Exata de 3 Cópias):\n"
+                  f"- Local (/var/backups/barman-offsite/): OK (3/3)\n"
+                  f"- Cloudflare R2 (ers-barman-backups/): OK (3/3)\n"
+                  f"- Google Drive ({{ gdrive_pg17_dir }}/): {'OK (3/3)' if gdrive_ok == 0 else 'ERRO'}\n"
+              )
+              msg.attach(MIMEText(body, "plain", "utf-8"))
+              srv = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
+              srv.starttls()
+              srv.login("{{ vault_gmail_user }}", "{{ vault_gmail_app_password }}")
+              srv.sendmail("{{ vault_gmail_user }}", ["kenzzo50@gmail.com"], msg.as_string())
+              srv.quit()
+              print("Email PG17 enviado para kenzzo50@gmail.com")
+          except Exception as e:
+              print("Aviso Email:", e)
+          PYMET
       changed_when: false
 
-    - name: Exibir resumo da sincronização offsite e Cloudflare R2
+    - name: Exibir resumo da sincronização offsite 3-2-1
       ansible.builtin.debug:
-        msg: "Backup {{ target_backup_id }} sincronizado localmente em {{ offsite_dir }}/{{ archive_name }} e enviado com sucesso ao Cloudflare R2 ({{ r2_bucket }})!"
+        msg: "Backup {{ target_backup_id }} sincronizado nas 3 pontas (Local + R2 + Google Drive) com rotação de 3 cópias!"

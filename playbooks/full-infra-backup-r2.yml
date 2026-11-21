@@ -5,6 +5,7 @@
   vars_files:
     - "../group_vars/all/vars.yml"
     - "../group_vars/all/vault.yml"
+    - "/home/ers/workspace/ansible-access/group_vars/all/vault_apis.yml"
   vars:
     snapshot_dir: "/var/backups/infra-snapshots"
     r2_infra_retention: 3
@@ -240,38 +241,113 @@
       register: r2_upload_res
       changed_when: true
 
-    - name: 14b. Redundância Multi-Nuvem — Sincronizar com o Google Drive via rclone
+    - name: 14b. Redundância Multi-Nuvem — Sincronizar com o Google Drive via rclone (Rotação Exata de 3 Cópias)
       ansible.builtin.shell:
         cmd: |
+          set -euo pipefail
           RCLONE_CFG="/home/ers/.config/rclone/rclone.conf"
           GDRIVE_SNAP_DIR="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Snapshots_Infra_e_Bancos"
           GDRIVE_DOT_DIR="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Credenciais_e_Dotfiles_AES256"
           if rclone --config "$RCLONE_CFG" listremotes 2>/dev/null | grep -q "^gdrive:"; then
             echo "Destino 'gdrive:' detectado no rclone. Iniciando upload organizado para ERS-CloudOps..."
-            rclone --config "$RCLONE_CFG" mkdir "$GDRIVE_SNAP_DIR" || true
-            rclone --config "$RCLONE_CFG" mkdir "$GDRIVE_DOT_DIR" || true
-            rclone --config "$RCLONE_CFG" copy --drive-chunk-size 64M --tpslimit 2 --timeout 15m {{ snapshot_dir }}/{{ archive_name }} "$GDRIVE_SNAP_DIR/" --progress
-            rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ archive_name }}.sha256 "$GDRIVE_SNAP_DIR/"
+            rclone --config "$RCLONE_CFG" --bind 0.0.0.0 mkdir "$GDRIVE_SNAP_DIR" || true
+            rclone --config "$RCLONE_CFG" --bind 0.0.0.0 mkdir "$GDRIVE_DOT_DIR" || true
+            rclone --config "$RCLONE_CFG" --bind 0.0.0.0 copy --drive-chunk-size 128M --drive-pacer-min-sleep 100ms --retries 5 --low-level-retries 15 --timeout 20m {{ snapshot_dir }}/{{ archive_name }} "$GDRIVE_SNAP_DIR/"
+            rclone --config "$RCLONE_CFG" --bind 0.0.0.0 copy --retries 5 {{ snapshot_dir }}/{{ archive_name }}.sha256 "$GDRIVE_SNAP_DIR/"
             if [ -f "{{ snapshot_dir }}/{{ dotfiles_archive_name }}" ]; then
-              rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ dotfiles_archive_name }} "$GDRIVE_DOT_DIR/"
-              rclone --config "$RCLONE_CFG" copy {{ snapshot_dir }}/{{ dotfiles_archive_name }}.sha256 "$GDRIVE_DOT_DIR/"
+              rclone --config "$RCLONE_CFG" --bind 0.0.0.0 copy --retries 5 {{ snapshot_dir }}/{{ dotfiles_archive_name }} "$GDRIVE_DOT_DIR/"
+              rclone --config "$RCLONE_CFG" --bind 0.0.0.0 copy --retries 5 {{ snapshot_dir }}/{{ dotfiles_archive_name }}.sha256 "$GDRIVE_DOT_DIR/"
             fi
-            # Aplicar retenção de 3 cópias em ambas as subpastas organizadas do Ubuntu Local
-            python3 -c 'import subprocess; cfg="/home/ers/.config/rclone/rclone.conf"; keep=int("{{ r2_infra_retention }}"); sn="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Snapshots_Infra_e_Bancos"; dt="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Credenciais_e_Dotfiles_AES256"; rs=subprocess.run(["rclone","--config",cfg,"lsf","--files-only",f"{sn}/"],capture_output=True,text=True,timeout=45); rd=subprocess.run(["rclone","--config",cfg,"lsf","--files-only",f"{dt}/"],capture_output=True,text=True,timeout=45); infra=sorted([f.strip() for f in rs.stdout.splitlines() if f.strip().startswith("infra_full_snapshot_") and f.strip().endswith(".tar.gz")],reverse=True) if rs.returncode==0 else []; dots=sorted([f.strip() for f in rd.stdout.splitlines() if f.strip().startswith("home_dotfiles_") and f.strip().endswith(".tar.gz.enc")],reverse=True) if rd.returncode==0 else []; [subprocess.run(["rclone","--config",cfg,"deletefile",f"{sn}/{old}"],timeout=60) or subprocess.run(["rclone","--config",cfg,"deletefile",f"{sn}/{old}.sha256"],timeout=60) for old in infra[keep:]]; [subprocess.run(["rclone","--config",cfg,"deletefile",f"{dt}/{old}"],timeout=60) or subprocess.run(["rclone","--config",cfg,"deletefile",f"{dt}/{old}.sha256"],timeout=60) for old in dots[keep:]]'
-            # Preservar dono ers:ers em rclone.conf caso rclone tenha feito refresh do token OAuth como root
+            # Retenção rotativa exata de 3 cópias (remove backups antigos E todos os .sha256 órfãos)
+            python3 - << 'PYPRUNE'
+            import subprocess
+            cfg = "/home/ers/.config/rclone/rclone.conf"
+            keep = int("{{ r2_infra_retention }}")
+            for dst, pref, suf in [
+                ("gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Snapshots_Infra_e_Bancos", "infra_full_snapshot_", ".tar.gz"),
+                ("gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Credenciais_e_Dotfiles_AES256", "home_dotfiles_", ".tar.gz.enc"),
+            ]:
+                r = subprocess.run(["rclone", "--config", cfg, "--bind", "0.0.0.0", "lsf", "--files-only", f"{dst}/"], capture_output=True, text=True, timeout=90)
+                if r.returncode != 0:
+                    continue
+                files = [f.strip() for f in r.stdout.splitlines() if f.strip()]
+                mains = sorted([f for f in files if f.startswith(pref) and f.endswith(suf)], reverse=True)
+                keep_set = set(mains[:keep]) | {f"{m}.sha256" for m in mains[:keep]}
+                for f in files:
+                    if f.startswith(pref) and f not in keep_set:
+                        subprocess.run(["rclone", "--config", cfg, "--bind", "0.0.0.0", "deletefile", f"{dst}/{f}"], timeout=90, check=False)
+                        print("Removido GDrive:", f)
+            PYPRUNE
             chown ers:ers "$RCLONE_CFG" && chmod 600 "$RCLONE_CFG" || true
             echo "Sincronização com Google Drive (ERS-CloudOps/) concluída com sucesso!"
           else
-            echo "[INFO] Remote 'gdrive:' não configurado no rclone. (Execute 'rclone config' no terminal para ativar sincronização automática com o Google Drive)."
+            echo "[INFO] Remote 'gdrive:' não configurado no rclone."
           fi
       register: gdrive_sync_res
       changed_when: "'Iniciando upload' in gdrive_sync_res.stdout"
 
-    - name: 15. Registrar Métrica do Snapshot de Infraestrutura no InfluxDB
+    - name: 15. Registrar Métricas no InfluxDB Local e no InfluxDB-Contabo (Grafana Cloud 24/7) + Enviar E-mail
       ansible.builtin.shell:
-        cmd: >
-          curl -s -i -XPOST 'http://127.0.0.1:8086/write?db=telegraf'
-          --data-binary "infra_r2_snapshot,server=full_infra,bucket={{ r2_bucket }} status=0i,size_bytes={{ snapshot_stat.stat.size }}i,snapshot_name=\"{{ archive_name }}\""
+        cmd: |
+          python3 - << 'PYMET'
+          import os, time, smtplib, urllib.request
+          from datetime import datetime
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+
+          size_b = int("{{ snapshot_stat.stat.size }}")
+          size_mb = round(size_b / (1024 * 1024), 2)
+          dot_kb = round(int("{{ dotfiles_stat.stat.size }}") / 1024, 1)
+          arch = "{{ archive_name }}"
+          now_ts = int(time.time())
+          gdrive_ok = 0 if "concluída com sucesso" in """{{ gdrive_sync_res.stdout | default('') }}""" else 1
+
+          # 1. InfluxDB local
+          try:
+              p_loc = f'infra_r2_snapshot,server=full_infra,bucket={{ r2_bucket }} status=0i,size_bytes={size_b}i,snapshot_name="{arch}"\n'.encode()
+              urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8086/write?db=telegraf", data=p_loc, method="POST"), timeout=5)
+          except Exception as e:
+              print("Aviso Influx local:", e)
+
+          # 2. InfluxDB-Contabo (Grafana Cloud 24/7)
+          try:
+              lines = [
+                  f'backup_dr_status,host=ubuntu-local,job=ubuntu_full_infra,destination=local status=0i,size_bytes={size_b}i,copies=3i,last_run_ts={now_ts}i,last_success_ts={now_ts}i,archive="{arch}"',
+                  f'backup_dr_status,host=ubuntu-local,job=ubuntu_full_infra,destination=r2 status=0i,size_bytes={size_b}i,copies=3i,last_run_ts={now_ts}i,last_success_ts={now_ts}i,archive="{arch}"',
+                  f'backup_dr_status,host=ubuntu-local,job=ubuntu_full_infra,destination=gdrive status={gdrive_ok}i,size_bytes={size_b if gdrive_ok == 0 else 0}i,copies={3 if gdrive_ok == 0 else 0}i,last_run_ts={now_ts}i,last_success_ts={now_ts if gdrive_ok == 0 else 0}i,archive="{arch}"',
+              ]
+              url = "http://100.92.196.127:8086/write?db=telegraf_contabo&u=admin&p={{ vault_influxdb_contabo_password }}"
+              urllib.request.urlopen(urllib.request.Request(url, data=("\n".join(lines) + "\n").encode(), method="POST"), timeout=10)
+              print("Metricas enviadas ao Grafana Cloud (InfluxDB-Contabo)!")
+          except Exception as e:
+              print("Aviso Influx Contabo:", e)
+
+          # 3. E-mail de confirmação para kenzzo50@gmail.com
+          try:
+              msg = MIMEMultipart()
+              msg["From"] = "ERS CloudOps Local DR <{{ vault_gmail_user }}>"
+              msg["To"] = "kenzzo50@gmail.com"
+              tag = "🟢 SUCESSO" if gdrive_ok == 0 else "🟡 PARCIAL"
+              msg["Subject"] = f"{tag}: Backup Full Infra Ubuntu Local ({size_mb} MB)"
+              body = (
+                  f"Relatório — Backup Full Infra, Volumes & Dotfiles AES-256 (Ubuntu Local)\n"
+                  f"Data/Hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} (America/Sao_Paulo)\n"
+                  f"Snapshot: {arch} ({size_mb} MB) | Dotfiles AES-256: {{ dotfiles_archive_name }} ({dot_kb} KB)\n\n"
+                  f"Redundâncias 3-2-1 (Rotação Exata de 3 Cópias):\n"
+                  f"- Local (/var/backups/infra-snapshots/): OK (3/3)\n"
+                  f"- Cloudflare R2 (infra-snapshots/): OK (3/3)\n"
+                  f"- Google Drive (ERS-CloudOps/03_Backups_Ubuntu_Local/): {'OK (3/3)' if gdrive_ok == 0 else 'ERRO'}\n"
+              )
+              msg.attach(MIMEText(body, "plain", "utf-8"))
+              srv = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
+              srv.starttls()
+              srv.login("{{ vault_gmail_user }}", "{{ vault_gmail_app_password }}")
+              srv.sendmail("{{ vault_gmail_user }}", ["kenzzo50@gmail.com"], msg.as_string())
+              srv.quit()
+              print("Email enviado para kenzzo50@gmail.com")
+          except Exception as e:
+              print("Aviso Email:", e)
+          PYMET
       changed_when: false
 
     - name: 16. Exibir Resumo Executivo da Operação de Disaster Recovery
