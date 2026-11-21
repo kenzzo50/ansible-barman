@@ -72,6 +72,27 @@
             -C /home/ers/workspace/terraform-portal/volumes/gitea gitea/conf ssh 2>/dev/null || true
       changed_when: true
 
+    - name: 6b. Backup de Volumes Docker Críticos de Estado Local (Terraform Portal, TimeMachine, Security, Migration)
+      ansible.builtin.shell:
+        cmd: |
+          mkdir -p {{ temp_work_dir }}/local_docker_volumes
+          for vol in \
+            terraform-portal_terraform-state \
+            terraform-portal_portal-data \
+            timemachine-portal_timemachine-data \
+            terraform-security-portal_security-data \
+            migration_migration_data; do
+            if docker volume inspect "$vol" >/dev/null 2>&1; then
+              ionice -c 3 nice -n 19 docker run --rm \
+                -v "${vol}:/source:ro" \
+                -v "{{ temp_work_dir }}/local_docker_volumes:/backup" \
+                alpine tar -czf "/backup/${vol}.tar.gz" -C /source . 2>/dev/null || true
+            fi
+          done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
     - name: 7. Backup Portátil do Banco Telegraf no InfluxDB
       ansible.builtin.shell:
         cmd: |
@@ -100,6 +121,7 @@
           - jenkins_essential_data.tar.gz (Jobs, Pipelines, Users, Secrets, Credentials)
           - gerrit_etc_and_git.tar.gz (Gerrit Git bare repos, reviews, All-Projects, All-Users)
           - gitea_data.tar.gz (Gitea conf, ssh, repos)
+          - local_docker_volumes/ (terraform-state, portal-data, timemachine-data, security-data, migration_data)
           - influxdb_backup/ (Métricas históricas Telegraf)
           =======================================================
           EOF
@@ -126,7 +148,7 @@
               --exclude='Trash' \
               -czf {{ snapshot_dir }}/home_dotfiles_{{ backup_ts }}.tar.gz \
               -C /home/ers \
-              .ansible_vault_pass .bash_aliases .bashrc .cntb.yaml .copilot .docker .git-templates .gitconfig .gnupg .jira_config .pgpass .profile .ssh .terraform.d .vscode .vscode-shared .cloud-locale-test.skip .wget-hsts 2>/dev/null || true
+              .ansible_vault_pass .bash_aliases .bashrc .cntb.yaml .config/rclone/rclone.conf .copilot .docker .git-templates .gitconfig .gnupg .jira_config .pgpass .profile .ssh .terraform.d .vscode .vscode-shared .cloud-locale-test.skip .wget-hsts 2>/dev/null || true
 
           # Criptografia forte AES-256-CBC com chave mestra ~/.ansible_vault_pass
           openssl enc -aes-256-cbc -salt -pbkdf2 -in {{ snapshot_dir }}/home_dotfiles_{{ backup_ts }}.tar.gz \
@@ -236,6 +258,8 @@
             fi
             # Aplicar retenção de 3 cópias em ambas as subpastas organizadas do Ubuntu Local
             python3 -c 'import subprocess; cfg="/home/ers/.config/rclone/rclone.conf"; keep=int("{{ r2_infra_retention }}"); sn="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Snapshots_Infra_e_Bancos"; dt="gdrive:ERS-CloudOps/03_Backups_Ubuntu_Local/Credenciais_e_Dotfiles_AES256"; rs=subprocess.run(["rclone","--config",cfg,"lsf","--files-only",f"{sn}/"],capture_output=True,text=True,timeout=45); rd=subprocess.run(["rclone","--config",cfg,"lsf","--files-only",f"{dt}/"],capture_output=True,text=True,timeout=45); infra=sorted([f.strip() for f in rs.stdout.splitlines() if f.strip().startswith("infra_full_snapshot_") and f.strip().endswith(".tar.gz")],reverse=True) if rs.returncode==0 else []; dots=sorted([f.strip() for f in rd.stdout.splitlines() if f.strip().startswith("home_dotfiles_") and f.strip().endswith(".tar.gz.enc")],reverse=True) if rd.returncode==0 else []; [subprocess.run(["rclone","--config",cfg,"deletefile",f"{sn}/{old}"],timeout=60) or subprocess.run(["rclone","--config",cfg,"deletefile",f"{sn}/{old}.sha256"],timeout=60) for old in infra[keep:]]; [subprocess.run(["rclone","--config",cfg,"deletefile",f"{dt}/{old}"],timeout=60) or subprocess.run(["rclone","--config",cfg,"deletefile",f"{dt}/{old}.sha256"],timeout=60) for old in dots[keep:]]'
+            # Preservar dono ers:ers em rclone.conf caso rclone tenha feito refresh do token OAuth como root
+            chown ers:ers "$RCLONE_CFG" && chmod 600 "$RCLONE_CFG" || true
             echo "Sincronização com Google Drive (ERS-CloudOps/) concluída com sucesso!"
           else
             echo "[INFO] Remote 'gdrive:' não configurado no rclone. (Execute 'rclone config' no terminal para ativar sincronização automática com o Google Drive)."
